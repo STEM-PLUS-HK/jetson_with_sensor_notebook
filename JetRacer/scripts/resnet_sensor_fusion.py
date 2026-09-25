@@ -17,7 +17,7 @@ def create_resnet18_sensor_fusion(output_dim, pretrained=True):
     # Identity: keep the 512-d pooled vector. Linear(512, 2) would already
     # be (x, y) and ToF could not be concatenated onto the image embedding.
     model.fc = torch.nn.Identity()
-    # 2 ToF values already mapped: 0-300 mm -> 1-0 (closer is larger), else 0
+    # 2 ToF values already mapped: 0-500 mm clamped, then 1-0 (closer is larger)
     model.sensor_fc = torch.nn.Linear(2, 16)
     # concat(512, 16) = 528 -> (x, y); this is the old fc, moved after concat
     model.fc_out = torch.nn.Linear(512 + 16, output_dim)
