@@ -1,4 +1,3 @@
-from smbus import SMBus
 import subprocess
 import threading
 import time
@@ -6,6 +5,13 @@ from pathlib import Path
 
 # VL53L0X writes 8190/8191 when it has no target. Teaching notebooks show that as 2000.
 TOF_CAP_MM = 2000
+# Same gap the test script uses between samples, shortened from 0.1 s.
+RANGE_PAUSE_S = 0.001
+# Orin Nano JP6: bus 1 is pins 27/28, bus 7 is pins 3/5. Same map as test_two_sensors.py.
+BLINKA_PINS = {
+    1: ("SCL_1", "SDA_1"),
+    7: ("SCL", "SDA"),
+}
 # 3 failed reads in a row, then at most one reset per 20s.
 # ponytail: a real (2000, 2000) is "nothing in range", so it must not reset the
 # car on an empty track. Only a failed read counts. A chip that still answers
@@ -60,7 +66,7 @@ def _sudo_password():
 
 
 def _run_hw_reset():
-    """Fix addresses, then XSHUT-pulse. The left sensor's XSHUT is tied high."""
+    """Fix addresses, then XSHUT-pulse. A failed 0x28 is software-reset over I2C."""
     script = Path(__file__).resolve().parents[1] / "JetRacer" / "scripts" / "sensor_soft_reset.sh"
     if not script.is_file():
         return False, "missing %s" % script
@@ -73,72 +79,21 @@ def _run_hw_reset():
     return r.returncode == 0, text
 
 
-class VL53L0X:
-    """ST VL53L0X ToF ranger over I2C (default address 0x29)."""
+def _open_i2c(bus_id):
+    """One shared bus, same Blinka pins as test_two_sensors.py."""
+    import board
+    import busio
 
-    SYSRANGE_START = 0x00
-    RESULT_INTERRUPT_STATUS = 0x13
-    RESULT_RANGE_STATUS = 0x14
-    RESULT_RANGE_MM = 0x1E
-    I2C_SLAVE_DEVICE_ADDRESS = 0x8A
-    IDENTIFICATION_MODEL_ID = 0xC0
+    names = BLINKA_PINS.get(int(bus_id))
+    if names is None:
+        known = ", ".join(str(k) for k in sorted(BLINKA_PINS))
+        raise RuntimeError("no Blinka pin map for i2c bus %s (known: %s)" % (bus_id, known))
+    scl, sda = getattr(board, names[0]), getattr(board, names[1])
+    return busio.I2C(scl, sda)
 
-    def __init__(self, bus=1, address=0x29) -> None:
-        self.bus_num = bus
-        self.bus = SMBus(bus)
-        self.address = address
-        self._glitch = {"good": None, "n": 0, "which": None}
-        model_id = self._read_u8(self.IDENTIFICATION_MODEL_ID)
-        if model_id != 0xEE:
-            raise RuntimeError('VL53L0X not found at 0x%02X (id=0x%02X)' % (address, model_id))
-        self._data_init()
 
-    def set_address(self, new_addr) -> None:
-        self._write_u8(self.I2C_SLAVE_DEVICE_ADDRESS, new_addr & 0x7F)
-        self.address = new_addr
-
-    def range_mm(self) -> int:
-        self._write_u8(0x80, 0x01)
-        self._write_u8(0xFF, 0x01)
-        self._write_u8(0x00, 0x00)
-        self._write_u8(0x91, self._stop_variable)
-        self._write_u8(0x00, 0x01)
-        self._write_u8(0xFF, 0x00)
-        self._write_u8(0x80, 0x00)
-        self._write_u8(self.SYSRANGE_START, 0x01)
-        for _ in range(100):
-            if (self._read_u8(self.SYSRANGE_START) & 0x01) == 0:
-                break
-            time.sleep(0.001)
-        value = self._read_u16(self.RESULT_RANGE_MM)
-        self._write_u8(0x0B, 0x01)
-        return hold_glitch(self._glitch, cap_mm(value))
-
-    def _data_init(self) -> None:
-        self._write_u8(0x88, 0x00)
-        self._write_u8(0x80, 0x01)
-        self._write_u8(0xFF, 0x01)
-        self._write_u8(0x00, 0x00)
-        self._stop_variable = self._read_u8(0x91)
-        self._write_u8(0x00, 0x01)
-        self._write_u8(0xFF, 0x00)
-        self._write_u8(0x80, 0x00)
-
-    def _write_u8(self, reg, val) -> None:
-        self.bus.write_byte_data(self.address, reg, val & 0xFF)
-
-    def _read_u8(self, reg) -> int:
-        return self.bus.read_byte_data(self.address, reg)
-
-    def _read_u16(self, reg) -> int:
-        data = self.bus.read_i2c_block_data(self.address, reg, 2)
-        return (data[0] << 8) | data[1]
-
-    def close(self) -> None:
-        try:
-            self.bus.close()
-        except Exception:
-            pass
+def _new_glitch():
+    return {"good": None, "n": 0, "which": None}
 
 
 class VL53Pair:
@@ -146,41 +101,79 @@ class VL53Pair:
 
     Both chips ship as 0x29. The left one is renamed to 0x28 (XSHUT tied
     high). The right one stays 0x29 (XSHUT on pin 29).
+
+    ``auto_resolve=True`` runs ``sensor_soft_reset.sh`` once when open fails
+    (timeout or any other error), then opens again. Later read failures still
+    reset in the background after a short streak. A real 2000 mm reading does not.
     """
 
-    def __init__(self, bus=1, addr_left=0x28, addr_right=0x29) -> None:
+    def __init__(self, bus=1, addr_left=0x28, addr_right=0x29, auto_resolve=True) -> None:
         self._bus_num = bus
         self._addr_left = addr_left
         self._addr_right = addr_right
+        self._auto_resolve = bool(auto_resolve)
         self._io_lock = threading.Lock()
         self._flag_lock = threading.Lock()
         self._resetting = False
         self._fail_streak = 0
         self._last_reset = 0.0
+        self._i2c = None
         self.left = None
         self.right = None
-        self._open()
+        self._glitch_left = _new_glitch()
+        self._glitch_right = _new_glitch()
+        try:
+            self._open()
+        except Exception:
+            if not self._auto_resolve:
+                raise
+            print("ToF open failed. Resetting the sensors.")
+            _ok, text = _run_hw_reset()
+            try:
+                self._open()
+            except Exception:
+                if text:
+                    print("\n".join(text.splitlines()[-6:]))
+                raise
+            print("ToF sensors are answering again after reset.")
 
     def _open(self) -> None:
-        self.left = VL53L0X(bus=self._bus_num, address=self._addr_left)
+        import adafruit_vl53l0x
+
+        self._i2c = _open_i2c(self._bus_num)
         try:
-            self.right = VL53L0X(bus=self._bus_num, address=self._addr_right)
+            # Same constructor the test script uses. io_timeout_s stops a dead
+            # chip from sitting in .range forever; the test script leaves it at 0.
+            self.left = adafruit_vl53l0x.VL53L0X(
+                self._i2c, address=self._addr_left, io_timeout_s=0.1)
+            self.right = adafruit_vl53l0x.VL53L0X(
+                self._i2c, address=self._addr_right, io_timeout_s=0.1)
         except Exception:
-            self.left.close()
-            self.left = None
+            self._close()
             raise
+        self._glitch_left = _new_glitch()
+        self._glitch_right = _new_glitch()
 
     def _close(self) -> None:
-        for dev in (self.left, self.right):
-            if dev is not None:
-                dev.close()
         self.left = None
         self.right = None
+        i2c = self._i2c
+        self._i2c = None
+        if i2c is not None:
+            try:
+                i2c.deinit()
+            except Exception:
+                pass
 
     def _clear_glitch(self) -> None:
-        for dev in (self.left, self.right):
-            if dev is not None:
-                dev._glitch.update(good=None, n=0, which=None)
+        self._glitch_left.update(good=None, n=0, which=None)
+        self._glitch_right.update(good=None, n=0, which=None)
+
+    def _sample(self, sensor, state) -> int:
+        """adafruit ``.range``, then 0.001 s. Cap and glitch filter stay for the notebooks."""
+        mm = int(sensor.range)
+        time.sleep(RANGE_PAUSE_S)
+        return hold_glitch(state, cap_mm(mm))
 
     def read_mm(self):
         """(left_mm, right_mm).
@@ -195,7 +188,10 @@ class VL53Pair:
         try:
             if self.left is not None and self.right is not None:
                 try:
-                    sample = (self.left.range_mm(), self.right.range_mm())
+                    sample = (
+                        self._sample(self.left, self._glitch_left),
+                        self._sample(self.right, self._glitch_right),
+                    )
                 except Exception:
                     self._clear_glitch()
                 else:
@@ -208,6 +204,8 @@ class VL53Pair:
         return (TOF_CAP_MM, TOF_CAP_MM)
 
     def _maybe_auto_reset(self) -> None:
+        if not self._auto_resolve:
+            return
         if should_auto_reset(self._fail_streak, self._resetting, time.time(), self._last_reset):
             self.request_reset(blocking=False, reason="ToF read failed. Resetting the sensors.")
 
@@ -234,8 +232,8 @@ class VL53Pair:
             self._close()
             try:
                 self._open()
-                self.left.range_mm()
-                self.right.range_mm()
+                self._sample(self.left, self._glitch_left)
+                self._sample(self.right, self._glitch_right)
             except Exception:
                 self._close()
                 return False
@@ -274,4 +272,21 @@ if __name__ == "__main__":
     assert should_auto_reset(5, True, 100, 0) is False
     assert should_auto_reset(5, False, 110, 100) is False
     assert should_auto_reset(5, False, 130, 100) is True
+
+    class _Pair:
+        _auto_resolve = False
+        _fail_streak = 5
+        _resetting = False
+        _last_reset = 0.0
+        calls = []
+
+        def request_reset(self, blocking=False, reason=""):
+            self.calls.append(reason)
+
+    quiet = _Pair()
+    VL53Pair._maybe_auto_reset(quiet)
+    assert quiet.calls == []
+    quiet._auto_resolve = True
+    VL53Pair._maybe_auto_reset(quiet)
+    assert quiet.calls == ["ToF read failed. Resetting the sensors."]
     print("vl53l0x filter ok")

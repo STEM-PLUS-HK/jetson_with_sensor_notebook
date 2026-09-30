@@ -2,7 +2,8 @@
 # Fix sensor addresses (same cases as Fix Sensors), then pulse XSHUT.
 # Does not stop Jupyter.
 # Pin 29 is XSHUT for the right sensor (0x29). The left sensor (0x28)
-# has XSHUT tied high, so the pulse cannot power-cycle it.
+# has XSHUT tied high, so the pulse cannot power-cycle it. If 0x28 then
+# fails the model-id read, the script software-resets that chip over I2C.
 set -u
 echo "== $(date) sensor reset start =="
 echo "== 1/2 fix sensor addresses =="
@@ -72,12 +73,40 @@ right_ok=0
 probe 0x28 && left_ok=1
 probe 0x29 && right_ok=1
 
+# 0xBF is SOFT_RESET. The chip comes back at 0x29, so 0x29 is held in
+# XSHUT first. A chip that never ACKs cannot be reset this way.
+if [ "$left_ok" -eq 0 ]; then
+    echo "== 0x28 failed. I2C software reset of the left sensor =="
+    echo "Pin 29 held low so the right sensor is off the bus."
+    gpioset --mode=exit "$chip" "${line}=0"
+    sleep 0.05
+    if i2cset -y 1 0x28 0xBF 0x00; then
+        sleep 0.01
+        i2cset -y 1 0x29 0xBF 0x01 || i2cset -y 1 0x28 0xBF 0x01 || echo "release soft reset failed"
+        sleep 0.1
+        if i2cget -y 1 0x29 0xC0 >/dev/null 2>&1; then
+            i2ctransfer -y 1 w2@0x29 0x8A 0x28 || echo "rename 0x29 -> 0x28 failed"
+        fi
+    else
+        echo "0x28 did not ACK. Software reset cannot reach a silent chip. Reseat VIN."
+    fi
+    echo "XSHUT high (right sensor boots again at 0x29)"
+    gpioset --mode=exit "$chip" "${line}=1" || true
+    sleep 0.1
+    echo "bus after left software reset:"
+    i2cdetect -y -r 1 || true
+    left_ok=0
+    right_ok=0
+    probe 0x28 && left_ok=1
+    probe 0x29 && right_ok=1
+fi
+
 echo "== sensor reset done. Jupyter was left running. =="
 echo "UU in the grid means a driver already owns that address."
 echo "Do not run the data notebook, the deploy loop, and test_two_sensors.py at the same time."
 echo "They share this I2C bus. A second reader causes errno 121 (Read failed)."
 if [ "$left_ok" -eq 0 ]; then
-    echo "0x28 still failed. This pulse only reboots the right sensor (0x29)."
+    echo "0x28 still failed after the I2C software reset."
     echo "Stop the other notebook or test script, click Reset Sensors again, then reseat the left sensor if it still fails."
 fi
 if [ "$right_ok" -eq 0 ]; then

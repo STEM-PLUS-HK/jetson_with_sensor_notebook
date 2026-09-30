@@ -129,7 +129,8 @@ def sensor_soft_reset(log=print):
     """Fix addresses (same as Fix Sensors), then pulse XSHUT. Does not stop Jupyter.
 
     The script remaps to left 0x28 + right 0x29, then reboots the right sensor.
-    The left sensor's XSHUT is tied high, so the pulse does not power-cycle it.
+    The left sensor's XSHUT is tied high. If 0x28 still fails the register
+    read, the script software-resets that chip over I2C and renames it back.
     """
     script = Path(__file__).resolve().with_name("sensor_soft_reset.sh")
     if not script.is_file():
