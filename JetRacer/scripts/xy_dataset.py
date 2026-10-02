@@ -28,31 +28,30 @@ def normalize_tof_tensor(sensors, max_mm=TOF_LINEAR_MAX_MM):
     return 1.0 - sensors / max_mm
 
 
-# Center of the strip is 20 mm. The outer edge is 500 mm. The two lines are adjustable and saved.
+# Center of the strip is 20 mm. The outer edge is 500 mm. The width line is adjustable and saved.
 BAR_NEAR_MM = 20
 BAR_EDGE_MM = 500
 _BAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bar_thresholds.json")
 _BAR_RED = (0, 0, 255)       # center line, 20 mm
-_BAR_MARK = (96, 96, 96)     # 1 car width, car case
+_BAR_MARK = (96, 96, 96)     # 1 car width
 
 
 def default_bar_thresholds():
-    return {"one_car": 200, "car_case": 50}
+    return {"one_car": 200}
 
 
 def _validate_bar_thresholds(data):
     try:
         one = int(data["one_car"])
-        case = int(data["car_case"])
     except (KeyError, TypeError, ValueError):
-        raise ValueError("need 1 car width and car case")
-    if not (BAR_NEAR_MM < case < one):
-        raise ValueError("need 20 < car case < 1 car width")
-    return {"one_car": one, "car_case": case}
+        raise ValueError("need 1 car width")
+    if not (BAR_NEAR_MM < one):
+        raise ValueError("need 1 car width greater than 20")
+    return {"one_car": one}
 
 
 def load_bar_thresholds(path=None):
-    """Read the saved lines. Missing or broken file keeps 200 / 50."""
+    """Read the saved line. Missing or broken file keeps 200."""
     global BAR_THRESH
     path = _BAR_FILE if path is None else path
     BAR_THRESH = default_bar_thresholds()
@@ -64,11 +63,11 @@ def load_bar_thresholds(path=None):
     return dict(BAR_THRESH)
 
 
-def save_bar_thresholds(one_car, car_case, path=None):
-    """Store the two lines. The next notebook start loads this file."""
+def save_bar_thresholds(one_car, path=None):
+    """Store the width line. The next notebook start loads this file."""
     global BAR_THRESH
     cleaned = _validate_bar_thresholds({
-        "one_car": one_car, "car_case": car_case,
+        "one_car": one_car,
     })
     path = _BAR_FILE if path is None else path
     with open(path, "w") as f:
@@ -108,8 +107,8 @@ def tof_clearance_bar(left_mm, right_mm, width, height=20):
     """BGR strip. Left sensor grows from the left edge, right sensor from the right.
 
     The outer edge is 500 mm. A farther reading leaves that edge white.
-    The fill is grey and gets darker toward the center. Grey ticks mark
-    1 car width and the car case. The center red line
+    The fill is grey and gets darker toward the center. A grey tick marks
+    1 car width. The center red line
     is 20 mm and is never painted over.
     """
     width = max(int(width), 32)
@@ -120,9 +119,9 @@ def tof_clearance_bar(left_mm, right_mm, width, height=20):
     left_cols = list(range(0, mid - 2))
     right_cols = list(range(width - 1, mid + 1, -1))
     th = BAR_THRESH
-    one, case = float(th["one_car"]), float(th["car_case"])
-    if not (BAR_NEAR_MM < case < one):
-        one, case = 200.0, 50.0
+    one = float(th["one_car"])
+    if not (BAR_NEAR_MM < one):
+        one = 200.0
     near = float(BAR_NEAR_MM)
     edge = float(BAR_EDGE_MM)
 
@@ -135,7 +134,7 @@ def tof_clearance_bar(left_mm, right_mm, width, height=20):
         for i, x in enumerate(cols[:n]):
             grey = _bar_grey(i, span)
             bar[:, x] = (grey, grey, grey)
-        for mark_mm in (one, case):
+        for mark_mm in (one,):
             i = _bar_pos(mark_mm, span, edge, near)
             i = span - 1 if mark_mm <= near else max(0, i - 1)
             for k in (i, min(span - 1, i + 1)):
@@ -329,19 +328,19 @@ if __name__ == '__main__':
     def mark_xs(image):
         return [i for i in range(image.shape[1] // 2) if _px(image, i) == _BAR_MARK]
 
-    BAR_THRESH = {"one_car": 200, "car_case": 50}
-    at_50 = mark_xs(tof_clearance_bar(553, 553, 224, 8))
-    BAR_THRESH = {"one_car": 200, "car_case": 120}
-    at_120 = mark_xs(tof_clearance_bar(553, 553, 224, 8))
-    assert at_50 and at_120 and max(at_120) < max(at_50), (at_50, at_120)
+    BAR_THRESH = {"one_car": 200}
+    at_200 = mark_xs(tof_clearance_bar(553, 553, 224, 8))
+    BAR_THRESH = {"one_car": 350}
+    at_350 = mark_xs(tof_clearance_bar(553, 553, 224, 8))
+    assert at_200 and at_350 and max(at_350) < max(at_200), (at_200, at_350)
     import tempfile
     fd, tmp = tempfile.mkstemp(suffix=".json")
     os.close(fd)
     try:
-        assert save_bar_thresholds(250, 80, path=tmp)["car_case"] == 80
-        assert load_bar_thresholds(path=tmp) == {"one_car": 250, "car_case": 80}
+        assert save_bar_thresholds(250, path=tmp) == {"one_car": 250}
+        assert load_bar_thresholds(path=tmp) == {"one_car": 250}
         try:
-            save_bar_thresholds(80, 90, path=tmp)
+            save_bar_thresholds(10, path=tmp)
             raise SystemExit("expected reject")
         except ValueError:
             pass

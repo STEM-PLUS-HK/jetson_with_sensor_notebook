@@ -179,9 +179,6 @@ class TrainUI:
         self.one_car_widget = ipywidgets.IntText(
             description="1 car width", value=thresholds["one_car"], style=field,
             layout=ipywidgets.Layout(width="200px"))
-        self.case_widget = ipywidgets.IntText(
-            description="car case", value=thresholds["car_case"], style=field,
-            layout=ipywidgets.Layout(width="160px"))
         self.bar_apply_button = ipywidgets.Button(description="apply")
         self.bar_apply_status = ipywidgets.HTML("")
         self.bar_apply_button.on_click(self._apply_bar)
@@ -193,8 +190,7 @@ class TrainUI:
         self.progress_widget = ipywidgets.FloatProgress(min=0.0, max=1.0, description="progress")
         self.widget = ipywidgets.VBox([
             ipywidgets.HBox([
-                self.one_car_widget, self.case_widget,
-                self.bar_apply_button, self.bar_apply_status,
+                self.one_car_widget, self.bar_apply_button, self.bar_apply_status,
             ]),
             self.epochs_widget,
             self.progress_widget,
@@ -208,7 +204,7 @@ class TrainUI:
 
     def _apply_bar(self, _):
         try:
-            self._save_bar(self.one_car_widget.value, self.case_widget.value)
+            self._save_bar(self.one_car_widget.value)
             self.bar_apply_status.value = "saved"
         except ValueError as exc:
             self.bar_apply_status.value = str(exc)
