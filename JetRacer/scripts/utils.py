@@ -14,3 +14,12 @@ def preprocess(image):
     image = transforms.functional.to_tensor(image).to(device)
     image.sub_(mean[:, None, None]).div_(std[:, None, None])
     return image[None, ...]
+
+
+def enable_oled():
+    """Turn the OLED stats page off, then on. The server is on this Jetson."""
+    import requests
+    base_url = "http://127.0.0.1:8000/stats"
+    for action in ("off", "on"):
+        response = requests.get("%s/%s" % (base_url, action), timeout=5)
+        print("%s:%s" % (action.upper(), response.status_code))
