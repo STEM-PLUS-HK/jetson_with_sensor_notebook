@@ -65,11 +65,30 @@ def _sudo_password():
         return "jetson"  # same lab default as scripts/remap_utils.py
 
 
+def _reset_script_paths(root, cwd):
+    """USB install writes the script under JetRacer/with_sensor/scripts/."""
+    name = Path("scripts") / "sensor_soft_reset.sh"
+    return (
+        Path(root) / "JetRacer" / "with_sensor" / name,
+        Path(cwd) / "with_sensor" / name,
+        Path(cwd) / name,
+        Path(root) / "JetRacer" / name,
+    )
+
+
+def _reset_script():
+    for script in _reset_script_paths(Path(__file__).resolve().parents[1], Path.cwd()):
+        if script.is_file():
+            return script
+    return None
+
+
 def _run_hw_reset():
     """Fix addresses, then XSHUT-pulse. A failed 0x28 is software-reset over I2C."""
-    script = Path(__file__).resolve().parents[1] / "JetRacer" / "scripts" / "sensor_soft_reset.sh"
-    if not script.is_file():
-        return False, "missing %s" % script
+    script = _reset_script()
+    if script is None:
+        looked = _reset_script_paths(Path(__file__).resolve().parents[1], Path.cwd())
+        return False, "missing sensor_soft_reset.sh\n" + "\n".join(str(p) for p in looked)
     r = subprocess.run(
         ["sudo", "-S", "bash", str(script)],
         input=_sudo_password() + "\n",
@@ -289,4 +308,7 @@ if __name__ == "__main__":
     quiet._auto_resolve = True
     VL53Pair._maybe_auto_reset(quiet)
     assert quiet.calls == ["ToF read failed. Resetting the sensors."]
+    paths = [str(p) for p in _reset_script_paths("/home/jetson/JetBot-JetRacer", "/home/jetson/JetBot-JetRacer/JetRacer")]
+    assert paths[0].endswith("JetRacer/with_sensor/scripts/sensor_soft_reset.sh"), paths
+    assert any(p.endswith("JetRacer/scripts/sensor_soft_reset.sh") for p in paths)
     print("vl53l0x filter ok")
