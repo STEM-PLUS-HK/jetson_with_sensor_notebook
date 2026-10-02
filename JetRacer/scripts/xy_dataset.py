@@ -28,16 +28,19 @@ def normalize_tof_tensor(sensors, max_mm=TOF_LINEAR_MAX_MM):
     return 1.0 - sensors / max_mm
 
 
-# Center of the strip is 20 mm. The outer edge is 500 mm. The width line is adjustable and saved.
+# The car body is fixed: 120 mm each side. A sensor reading is drawn 100 mm
+# farther out (20 mm → 120, 240 mm → 340, 500 mm → 600). The strip is -600 to +600.
 BAR_NEAR_MM = 20
 BAR_EDGE_MM = 500
+CAR_HALF_MM = 120
+BAR_AXIS_MM = CAR_HALF_MM + (BAR_EDGE_MM - BAR_NEAR_MM)
 _BAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bar_thresholds.json")
-_BAR_RED = (0, 0, 255)       # center line, 20 mm
-_BAR_MARK = (96, 96, 96)     # 1 car width
+_BAR_CAR = (168, 168, 168)   # fixed car body, ±120 mm
+_BAR_MARK = (96, 96, 96)     # 1 car width sensor threshold
 
 
 def default_bar_thresholds():
-    return {"one_car": 200}
+    return {"one_car": 240}
 
 
 def _validate_bar_thresholds(data):
@@ -45,13 +48,13 @@ def _validate_bar_thresholds(data):
         one = int(data["one_car"])
     except (KeyError, TypeError, ValueError):
         raise ValueError("need 1 car width")
-    if not (BAR_NEAR_MM < one):
-        raise ValueError("need 1 car width greater than 20")
+    if not (BAR_NEAR_MM < one < BAR_EDGE_MM):
+        raise ValueError("need 20 < 1 car width < 500")
     return {"one_car": one}
 
 
 def load_bar_thresholds(path=None):
-    """Read the saved line. Missing or broken file keeps 200."""
+    """Read the saved sensor threshold. Missing or broken file keeps 240."""
     global BAR_THRESH
     path = _BAR_FILE if path is None else path
     BAR_THRESH = default_bar_thresholds()
@@ -64,7 +67,7 @@ def load_bar_thresholds(path=None):
 
 
 def save_bar_thresholds(one_car, path=None):
-    """Store the width line. The next notebook start loads this file."""
+    """Store the sensor threshold. The next notebook start loads this file."""
     global BAR_THRESH
     cleaned = _validate_bar_thresholds({
         "one_car": one_car,
@@ -81,69 +84,72 @@ BAR_THRESH = default_bar_thresholds()
 load_bar_thresholds()
 
 
-def _bar_pos(mm, span, edge, near):
-    """How many columns to fill from the outer edge toward the center.
-
-    The outer edge is `edge` mm (500). A reading farther than that fills nothing.
-    """
-    mm = float(mm)
-    if mm >= edge or span <= 0:
-        return 0
-    if mm <= near:
-        return span
-    t = (edge - mm) / float(edge - near)
-    return max(0, min(span, int(round(t * span))))
+def _sensor_mm(sensor):
+    """Sensor mm → mm from the center. 20 → 120, 240 → 340, 500 → 600."""
+    sensor = float(sensor)
+    if sensor >= BAR_EDGE_MM:
+        return float(BAR_AXIS_MM)
+    if sensor <= BAR_NEAR_MM:
+        return float(CAR_HALF_MM)
+    return sensor + (CAR_HALF_MM - BAR_NEAR_MM)
 
 
-def _bar_grey(index, span):
-    """0 at the center (closest) and 255 at the outer edge (farthest)."""
+def _mm_index(mm_from_center, span, axis):
+    """0 is the outer edge (`axis` mm). span-1 is the center."""
     if span <= 1:
         return 0
-    t = index / float(span - 1)
-    return int(round(255 * (1.0 - t)))
+    t = (axis - float(mm_from_center)) / float(axis)
+    return max(0, min(span - 1, int(round(t * (span - 1)))))
+
+
+def _bar_red(index, span):
+    """BGR. Pale red at the outer edge, dark red toward the car."""
+    t = 0.0 if span <= 1 else index / float(span - 1)
+    pale = (255, 255, 255)
+    dark = (20, 20, 255)
+
+    def mix(a, b):
+        return int(round(a + (b - a) * t))
+
+    return (mix(pale[0], dark[0]), mix(pale[1], dark[1]), mix(pale[2], dark[2]))
 
 
 def tof_clearance_bar(left_mm, right_mm, width, height=20):
     """BGR strip. Left sensor grows from the left edge, right sensor from the right.
 
-    The outer edge is 500 mm. A farther reading leaves that edge white.
-    The fill is grey and gets darker toward the center. A grey tick marks
-    1 car width. The center red line
-    is 20 mm and is never painted over.
+    The middle ±120 mm is the car and always grey. A 20 mm reading sits on
+    that edge. 240 mm (1 car width) is drawn at 340 mm. The ends are ±600 mm,
+    a 500 mm reading.
     """
     width = max(int(width), 32)
     height = max(int(height), 1)
     bar = np.full((height, width, 3), 255, dtype=np.uint8)
     mid = width // 2
-    # mid-2 and mid+1 stay white. mid-1 and mid are the 20 mm line.
-    left_cols = list(range(0, mid - 2))
-    right_cols = list(range(width - 1, mid + 1, -1))
+    left_cols = list(range(0, mid - 1))
+    right_cols = list(range(width - 1, mid, -1))
     th = BAR_THRESH
-    one = float(th["one_car"])
-    if not (BAR_NEAR_MM < one):
-        one = 200.0
-    near = float(BAR_NEAR_MM)
-    edge = float(BAR_EDGE_MM)
+    mark = float(th["one_car"])
+    if not (BAR_NEAR_MM < mark < BAR_EDGE_MM):
+        mark = 240.0
 
     def paint(cols, mm):
         if mm is None:
-            mm = edge + 1.0
-        mm = float(mm)
+            mm = BAR_EDGE_MM + 1.0
         span = len(cols)
-        n = _bar_pos(mm, span, edge, near)
-        for i, x in enumerate(cols[:n]):
-            grey = _bar_grey(i, span)
-            bar[:, x] = (grey, grey, grey)
-        for mark_mm in (one,):
-            i = _bar_pos(mark_mm, span, edge, near)
-            i = span - 1 if mark_mm <= near else max(0, i - 1)
-            for k in (i, min(span - 1, i + 1)):
-                bar[:, cols[k]] = _BAR_MARK
+        sensor_at = _mm_index(_sensor_mm(mm), span, BAR_AXIS_MM)
+        car_at = _mm_index(CAR_HALF_MM, span, BAR_AXIS_MM)
+        mark_at = _mm_index(_sensor_mm(mark), span, BAR_AXIS_MM)
+        for i in range(sensor_at):
+            bar[:, cols[i]] = _bar_red(i, span)
+        for i in range(car_at, span):
+            bar[:, cols[i]] = _BAR_CAR
+        for k in (mark_at, min(span - 1, mark_at + 1)):
+            bar[:, cols[k]] = _BAR_MARK
 
     paint(left_cols, left_mm)
     paint(right_cols, right_mm)
-    bar[:, mid - 1] = _BAR_RED
-    bar[:, mid] = _BAR_RED
+    bar[:, mid - 1] = _BAR_CAR
+    bar[:, mid] = _BAR_CAR
     return bar
 
 
@@ -313,26 +319,32 @@ if __name__ == '__main__':
     def _px(image, x):
         return tuple(int(v) for v in image[4, x])
 
-    close = tof_clearance_bar(10, 10, 224, 8)
+    BAR_THRESH = {"one_car": 240}
+    assert _sensor_mm(20) == 120 and _sensor_mm(50) == 150
+    assert _sensor_mm(240) == 340 and _sensor_mm(500) == 600
+    assert BAR_AXIS_MM == 600
+    close = tof_clearance_bar(20, 50, 224, 8)
     assert close.shape == (8, 224, 3)
-    assert _px(close, 111) == _BAR_RED and _px(close, 112) == _BAR_RED
-    assert _px(close, 110) == (255, 255, 255) and _px(close, 113) == (255, 255, 255)
-    assert _px(close, 40)[0] > _px(close, 109)[0]
+    assert _px(close, 111) == _BAR_CAR and _px(close, 112) == _BAR_CAR
+    assert _px(close, 110) == _BAR_CAR and _px(close, 113) == _BAR_CAR
+    # left 20 mm fills to the car edge: red, and darker toward the car
+    assert _px(close, 20)[2] > _px(close, 20)[0]
+    assert _px(close, 70)[2] < _px(close, 20)[2]
+    # right 50 mm stops at 150 mm: outer side is filled, the gap before the car stays white
+    assert _px(close, 183)[0] < 255 and _px(close, 139) == (255, 255, 255)
     far = tof_clearance_bar(553, 553, 224, 8)
     assert _px(far, 0) == (255, 255, 255) and _px(far, -1) == (255, 255, 255)
-    assert _px(far, 111) == _BAR_RED
-    zoned = tof_clearance_bar(125, 553, 224, 8)
-    assert _px(zoned, 40)[0] > _px(zoned, 75)[0]
-    assert _px(zoned, -1) == (255, 255, 255)
+    assert _px(far, 110) == _BAR_CAR and _px(far, 111) == _BAR_CAR
 
     def mark_xs(image):
         return [i for i in range(image.shape[1] // 2) if _px(image, i) == _BAR_MARK]
 
-    BAR_THRESH = {"one_car": 200}
-    at_200 = mark_xs(tof_clearance_bar(553, 553, 224, 8))
-    BAR_THRESH = {"one_car": 350}
-    at_350 = mark_xs(tof_clearance_bar(553, 553, 224, 8))
-    assert at_200 and at_350 and max(at_350) < max(at_200), (at_200, at_350)
+    at_120 = mark_xs(tof_clearance_bar(553, 553, 224, 8))
+    assert _px(tof_clearance_bar(553, 553, 224, 8), 110) == _BAR_CAR
+    BAR_THRESH = {"one_car": 120}
+    at_near = mark_xs(tof_clearance_bar(553, 553, 224, 8))
+    assert at_120 and at_near and max(at_120) < max(at_near), (at_120, at_near)
+    assert _px(tof_clearance_bar(553, 553, 224, 8), 110) == _BAR_CAR
     import tempfile
     fd, tmp = tempfile.mkstemp(suffix=".json")
     os.close(fd)

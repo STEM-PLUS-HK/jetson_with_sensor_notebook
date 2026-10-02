@@ -231,8 +231,7 @@ class VL53Pair:
     def request_reset(self, blocking=False, reason="Resetting the sensors.") -> None:
         """Close the bus, pulse XSHUT, and initialise the chips again.
 
-        `blocking=False` is for the read loop. The notebook button uses
-        `blocking=True` on its own thread. Either way `read_mm` keeps
+        `blocking=False` is for the read loop. Either way `read_mm` keeps
         returning (2000, 2000) until the sensors answer.
         """
         with self._flag_lock:
@@ -245,6 +244,30 @@ class VL53Pair:
             self._recover()
         else:
             threading.Thread(target=self._recover, daemon=True).start()
+
+    def reset_sensors(self) -> None:
+        """Run the same script as troubleshoot Reset Sensors, then open the chips.
+
+        The bus is closed first so the script can use I2C. `read_mm` returns
+        (2000, 2000) until the sensors answer.
+        """
+        from scripts.remap_utils import sensor_soft_reset
+
+        with self._flag_lock:
+            if self._resetting:
+                return
+            self._resetting = True
+            self._last_reset = time.time()
+        try:
+            with self._io_lock:
+                self._close()
+            sensor_soft_reset()
+            if self._reopen():
+                print("ToF sensors are answering again after reset.")
+            else:
+                print("ToF reset did not bring the sensors back.")
+        finally:
+            self._resetting = False
 
     def _reopen(self) -> bool:
         with self._io_lock:
