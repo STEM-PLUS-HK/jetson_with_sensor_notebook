@@ -101,14 +101,21 @@ if [ "$left_ok" -eq 0 ]; then
     probe 0x29 && right_ok=1
 fi
 
-echo "== sensor reset done. Jupyter was left running. =="
 echo "UU in the grid means a driver already owns that address."
 echo "Do not run the data notebook, the deploy loop, and test_two_sensors.py at the same time."
 echo "They share this I2C bus. A second reader causes errno 121 (Read failed)."
-if [ "$left_ok" -eq 0 ]; then
-    echo "0x28 still failed after the I2C software reset."
-    echo "Stop the other notebook or test script, click Reset Sensors again, then reseat the left sensor if it still fails."
-fi
-if [ "$right_ok" -eq 0 ]; then
-    echo "0x29 still failed. Click Reset Sensors once more with no other program reading the sensors."
+# Jupyter renders these escapes in the button output. Always on: stdout is a pipe, not a tty.
+red() { printf '\033[31m%s\033[0m\n' "$1"; }
+green() { printf '\033[32m%s\033[0m\n' "$1"; }
+if [ "$left_ok" -eq 1 ] && [ "$right_ok" -eq 1 ]; then
+    green "Reset successfully. Jupyter was left running."
+else
+    if [ "$left_ok" -eq 0 ]; then
+        red "0x28 still failed after the I2C software reset."
+        red "Stop the other notebook or test script, click Reset Sensors again, then reseat the left sensor if it still fails."
+    fi
+    if [ "$right_ok" -eq 0 ]; then
+        red "0x29 still failed. Click Reset Sensors once more with no other program reading the sensors."
+    fi
+    red "Reset failed."
 fi
