@@ -115,6 +115,11 @@ def _new_glitch():
     return {"good": None, "n": 0, "which": None}
 
 
+# One open pair per bus. Re-running the notebook cell must close the old reader
+# or both use I2C at once (errno 121). The background thread keeps the old object alive.
+_OPEN_PAIRS = {}
+
+
 class VL53Pair:
     """Left / right VL53L0X on one I2C bus.
 
@@ -141,6 +146,19 @@ class VL53Pair:
         self.right = None
         self._glitch_left = _new_glitch()
         self._glitch_right = _new_glitch()
+        self._closed = False
+        self._latest = (TOF_CAP_MM, TOF_CAP_MM)
+        self._sampled = threading.Event()
+        self._range_stop = threading.Event()
+        self._range_thread = None
+        prev = _OPEN_PAIRS.get(self._bus_num)
+        if prev is not None and prev is not self:
+            prev.close()
+            thread = prev._range_thread
+            if thread is not None and thread.is_alive():
+                raise RuntimeError(
+                    "ToF reader is still on the bus. Restart the kernel and run this cell again.")
+        _OPEN_PAIRS[self._bus_num] = self
         try:
             self._open()
         except Exception:
@@ -155,6 +173,43 @@ class VL53Pair:
                     print("\n".join(text.splitlines()[-6:]))
                 raise
             print("ToF sensors are answering again after reset.")
+        # The chips take ~0.07 s. Read them off to the side so the drive loop
+        # can keep up with the camera. read_mm returns the newest pair.
+        self._range_thread = threading.Thread(target=self._range_loop, daemon=True)
+        self._range_thread.start()
+
+    def close(self) -> None:
+        """Stop the background read and release I2C so a new VL53Pair can open.
+
+        Safe to call again. If the reader is still inside a measurement, the bus
+        stays open until a later close, so a new pair does not share it.
+        """
+        self._closed = True
+        self._range_stop.set()
+        thread = self._range_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+            if thread.is_alive():
+                return
+        if self._i2c is None and self.left is None:
+            if _OPEN_PAIRS.get(self._bus_num) is self:
+                del _OPEN_PAIRS[self._bus_num]
+            return
+        if self._io_lock.acquire(timeout=1.5):
+            try:
+                self._close()
+            finally:
+                self._io_lock.release()
+        if _OPEN_PAIRS.get(self._bus_num) is self and self._i2c is None:
+            del _OPEN_PAIRS[self._bus_num]
+
+    def _range_loop(self) -> None:
+        while not self._range_stop.is_set() and not self._closed:
+            if self._resetting:
+                time.sleep(0.05)
+                continue
+            self._latest = self._read_blocking()
+            self._sampled.set()
 
     def _open(self) -> None:
         import adafruit_vl53l0x
@@ -195,14 +250,21 @@ class VL53Pair:
         return hold_glitch(state, cap_mm(mm))
 
     def read_mm(self):
-        """(left_mm, right_mm).
+        """(left_mm, right_mm). Returns the newest pair and does not wait.
 
         A failed read (any error, not only OSError) returns (2000, 2000) and,
         after a short streak, resets the sensors on a background thread.
         A real reading of 2000 mm does not. The caller is not blocked while
         a reset is in progress.
         """
-        if self._resetting or not self._io_lock.acquire(blocking=False):
+        if not self._sampled.is_set():
+            self._sampled.wait(0.3)
+        if self._resetting:
+            return (TOF_CAP_MM, TOF_CAP_MM)
+        return self._latest
+
+    def _read_blocking(self):
+        if self._closed or self._range_stop.is_set() or self._resetting or not self._io_lock.acquire(blocking=False):
             return (TOF_CAP_MM, TOF_CAP_MM)
         try:
             if self.left is not None and self.right is not None:
@@ -218,12 +280,16 @@ class VL53Pair:
                     return sample
         finally:
             self._io_lock.release()
+        # A close or reset may have started during this measurement. Do not
+        # launch another reset, or it will use I2C while the new pair opens.
+        if self._closed or self._range_stop.is_set() or self._resetting:
+            return (TOF_CAP_MM, TOF_CAP_MM)
         self._fail_streak += 1
         self._maybe_auto_reset()
         return (TOF_CAP_MM, TOF_CAP_MM)
 
     def _maybe_auto_reset(self) -> None:
-        if not self._auto_resolve:
+        if self._closed or self._range_stop.is_set() or not self._auto_resolve:
             return
         if should_auto_reset(self._fail_streak, self._resetting, time.time(), self._last_reset):
             self.request_reset(blocking=False, reason="ToF read failed. Resetting the sensors.")
@@ -320,6 +386,8 @@ if __name__ == "__main__":
         _fail_streak = 5
         _resetting = False
         _last_reset = 0.0
+        _closed = False
+        _range_stop = threading.Event()
         calls = []
 
         def request_reset(self, blocking=False, reason=""):
@@ -331,6 +399,40 @@ if __name__ == "__main__":
     quiet._auto_resolve = True
     VL53Pair._maybe_auto_reset(quiet)
     assert quiet.calls == ["ToF read failed. Resetting the sensors."]
+    cached = VL53Pair.__new__(VL53Pair)
+    cached._resetting = False
+    cached._latest = (11, 22)
+    cached._sampled = threading.Event()
+    cached._sampled.set()
+    assert VL53Pair.read_mm(cached) == (11, 22)
+    cached._resetting = True
+    assert VL53Pair.read_mm(cached) == (2000, 2000)
+    old = VL53Pair.__new__(VL53Pair)
+    old._bus_num = 99
+    old._closed = False
+    old._range_stop = threading.Event()
+    old._range_thread = None
+    old._io_lock = threading.Lock()
+    old._i2c = None
+    old.left = None
+    old.right = None
+    _OPEN_PAIRS[99] = old
+    old.close()
+    assert old._closed and 99 not in _OPEN_PAIRS
+    old.close()
+    dead = VL53Pair.__new__(VL53Pair)
+    dead._closed = True
+    dead._range_stop = threading.Event()
+    dead._range_stop.set()
+    dead._resetting = False
+    dead._io_lock = threading.Lock()
+    dead._fail_streak = 0
+    dead._auto_resolve = True
+    dead._i2c = None
+    dead.left = None
+    dead.right = None
+    assert VL53Pair._read_blocking(dead) == (2000, 2000)
+    assert dead._fail_streak == 0
     paths = [str(p) for p in _reset_script_paths("/home/jetson/JetBot-JetRacer", "/home/jetson/JetBot-JetRacer/JetRacer")]
     assert paths[0].endswith("JetRacer/with_sensor/scripts/sensor_soft_reset.sh"), paths
     assert any(p.endswith("JetRacer/scripts/sensor_soft_reset.sh") for p in paths)
